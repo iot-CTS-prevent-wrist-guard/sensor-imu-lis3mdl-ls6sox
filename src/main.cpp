@@ -8,7 +8,7 @@
 #define I2C_SCL 22
 
 #define SAMPLE_HZ 50
-#define PRINT_HZ 10
+#define PRINT_HZ 2
 
 #define ENABLE_CALIBRATION 1
 
@@ -19,33 +19,36 @@ bool lsmReady = false;
 bool magReady = false;
 
 // --------------------------------------------------
-// 최종 각도 중립값
+// 중립값
 // --------------------------------------------------
 
 float wristNeutralDeg = 0.0f;
 float palmNeutralDeg = 0.0f;
 
-// 비교용 TILT palm 중립값
-float palmTiltNeutralDeg = 0.0f;
+// accelStable 판정용 기준값
+float accelNeutralTotal = 9.8f;
+
+// --------------------------------------------------
+// accelStable 히스테리시스
+// --------------------------------------------------
+// ENTER: 다시 안정 상태로 들어오는 기준
+// EXIT : 안정 상태에서 벗어나는 기준
+//
+// 예: A0 = 10.17일 때
+// 안정 상태에서 A가 9.50 정도로 내려가도 바로 S:N으로 안 바뀜.
+// A가 확실히 크게 벗어나야 S:N으로 바뀜.
+
+bool accelStableState = true;
+
+const float ACCEL_STABLE_ENTER_TOL = 0.6f;
+const float ACCEL_STABLE_EXIT_TOL  = 0.9f;
 
 // --------------------------------------------------
 // 교차 간섭 보정 계수
 // --------------------------------------------------
-// b: palm 움직임이 wrist 값에 섞이는 비율
-// c: wrist 움직임이 palm 값에 섞이는 비율
-//
-// 처음에는 둘 다 0으로 둔다.
-// 로그 보고 나중에 조정한다.
-//
-// 예:
-// wrist만 움직였는데 wrist=40, palm=8이면
-// c = 8 / 40 = 0.2
-//
-// palm만 움직였는데 palm=50, wrist=-10이면
-// b = -10 / 50 = -0.2
 
-float COUPLE_WRIST_FROM_PALM = 0.0f;  // b
-float COUPLE_PALM_FROM_WRIST = 0.0f;  // c
+float COUPLE_WRIST_FROM_PALM = 0.0f;
+float COUPLE_PALM_FROM_WRIST = 0.0f;
 
 // --------------------------------------------------
 // 최종 출력 필터
@@ -55,8 +58,13 @@ float wristFinalDeg = 0.0f;
 float palmFinalDeg = 0.0f;
 bool finalAngleInit = false;
 
-const float ALPHA_FINAL = 0.25f;        // 클수록 빠르게 반응
-const float ANGLE_DEADBAND_DEG = 0.5f;  // 이 이하 각도는 0 처리
+const float ALPHA_STABLE = 0.25f;
+const float ALPHA_UNSTABLE = 0.04f;
+const float ANGLE_DEADBAND_DEG = 0.5f;
+
+// --------------------------------------------------
+// 유틸
+// --------------------------------------------------
 
 float radToDeg(float rad) {
   return rad * 180.0f / PI;
@@ -87,12 +95,12 @@ float applyDeadbandDeg(float angleDeg, float deadbandDeg) {
 
 bool initLSM6DSOX() {
   if (lsm6dsox.begin_I2C(0x6A, &Wire)) {
-    Serial.println("LSM6DSOX found at 0x6A");
+    Serial.println("LSM6DSOX OK: 0x6A");
     return true;
   }
 
   if (lsm6dsox.begin_I2C(0x6B, &Wire)) {
-    Serial.println("LSM6DSOX found at 0x6B");
+    Serial.println("LSM6DSOX OK: 0x6B");
     return true;
   }
 
@@ -101,12 +109,12 @@ bool initLSM6DSOX() {
 
 bool initLIS3MDL() {
   if (lis3mdl.begin_I2C(0x1C, &Wire)) {
-    Serial.println("LIS3MDL found at 0x1C");
+    Serial.println("LIS3MDL OK: 0x1C");
     return true;
   }
 
   if (lis3mdl.begin_I2C(0x1E, &Wire)) {
-    Serial.println("LIS3MDL found at 0x1E");
+    Serial.println("LIS3MDL OK: 0x1E");
     return true;
   }
 
@@ -127,50 +135,12 @@ void readSensors(
 }
 
 // --------------------------------------------------
-// 기존 RAW 비교용
+// 각도 계산
 // --------------------------------------------------
-
-float calcWristRawDeg(float ay, float az) {
-  return radToDeg(atan2(ay, az));
-}
-
-float calcPalmRawDeg(float ax, float az) {
-  return radToDeg(atan2(ax, az));
-}
-
-// --------------------------------------------------
-// wrist 계산
-// --------------------------------------------------
-// 손목 굽힘/젖힘.
-// 네 장착 기준에서 Y-Z 변화로 보는 값.
-// palm 회전 영향을 줄이려고 기준축을 az 하나가 아니라
-// sqrt(ax^2 + az^2)로 잡는다.
 
 float calcWristFlexDeg(float ax, float ay, float az) {
   return radToDeg(atan2(ay, sqrt(ax * ax + az * az)));
 }
-
-// --------------------------------------------------
-// 기존 palm TILT 비교용
-// --------------------------------------------------
-// 이 방식은 wrist 영향은 줄지만,
-// sqrt 때문에 90도 이후 방향이 접히는 문제가 있음.
-// 최종 palm 판정용으로 쓰지 말고 비교용으로만 본다.
-
-float calcPalmFlipTiltDeg(float ax, float ay, float az) {
-  return radToDeg(atan2(ax, sqrt(ay * ay + az * az)));
-}
-
-// --------------------------------------------------
-// 최종 palm signed 계산
-// --------------------------------------------------
-// 손바닥 뒤집힘.
-// 기존 TILT palm은 sqrt 때문에 부호가 접힌다.
-// 그래서 wrist 각도를 먼저 추정한 뒤,
-// wrist 굽힘 때문에 바뀐 Z축을 보정하고,
-// ax와 보정된 az로 atan2를 계산한다.
-//
-// 이 값이 최종 palm 후보값이다.
 
 float calcPalmFlipSignedDeg(float ax, float ay, float az) {
   float wristRad = atan2(ay, sqrt(ax * ax + az * az));
@@ -178,7 +148,6 @@ float calcPalmFlipSignedDeg(float ax, float ay, float az) {
   float s = sin(wristRad);
   float c = cos(wristRad);
 
-  // wrist 굽힘 성분을 반영해서 Z축 기준을 보정
   float azCorrected = ay * s + az * c;
 
   return radToDeg(atan2(ax, azCorrected));
@@ -187,12 +156,6 @@ float calcPalmFlipSignedDeg(float ax, float ay, float az) {
 // --------------------------------------------------
 // 2축 교차보정
 // --------------------------------------------------
-// wristMeasured = wristTrue + b * palmTrue
-// palmMeasured  = c * wristTrue + palmTrue
-//
-// 역행렬로 wristTrue, palmTrue를 추정한다.
-// 이 방식은 한쪽을 고정하지 않는다.
-// wrist와 palm이 동시에 움직여도 둘 다 계산한다.
 
 void decoupleWristPalm(
   float wristMeasuredDeg,
@@ -206,7 +169,6 @@ void decoupleWristPalm(
   float det = 1.0f - b * c;
 
   if (fabs(det) < 0.2f) {
-    // 보정식 폭주 방지
     wristOutDeg = wristMeasuredDeg;
     palmOutDeg = palmMeasuredDeg;
     return;
@@ -224,13 +186,11 @@ void decoupleWristPalm(
 // --------------------------------------------------
 
 void calibrateNeutralPose() {
-  Serial.println();
-  Serial.println("Neutral calibration start");
-  Serial.println("Keep the hand in neutral position for 3 seconds.");
+  Serial.println("CAL START: keep neutral pose");
 
   delay(1000);
 
-  const int samples = 150;
+  const int samples = SAMPLE_HZ * 3;
 
   float axSum = 0.0f;
   float aySum = 0.0f;
@@ -258,27 +218,29 @@ void calibrateNeutralPose() {
   wristNeutralDeg = calcWristFlexDeg(axAvg, ayAvg, azAvg);
   palmNeutralDeg = calcPalmFlipSignedDeg(axAvg, ayAvg, azAvg);
 
-  palmTiltNeutralDeg = calcPalmFlipTiltDeg(axAvg, ayAvg, azAvg);
+  accelNeutralTotal = sqrt(axAvg * axAvg + ayAvg * ayAvg + azAvg * azAvg);
 
-  Serial.println("Neutral calibration done");
+  accelStableState = true;
 
-  Serial.print("neutral accel avg | X: ");
-  Serial.print(axAvg, 4);
-  Serial.print(" Y: ");
-  Serial.print(ayAvg, 4);
-  Serial.print(" Z: ");
-  Serial.println(azAvg, 4);
+  Serial.print("CAL DONE | W0:");
+  Serial.print(wristNeutralDeg, 2);
 
-  Serial.print("neutral final deg | wrist: ");
-  Serial.print(wristNeutralDeg, 3);
-  Serial.print(" palm_signed: ");
-  Serial.println(palmNeutralDeg, 3);
+  Serial.print(" P0:");
+  Serial.print(palmNeutralDeg, 2);
 
-  Serial.print("neutral compare   | palm_tilt: ");
-  Serial.println(palmTiltNeutralDeg, 3);
+  Serial.print(" A0:");
+  Serial.print(accelNeutralTotal, 2);
 
-  Serial.println();
+  Serial.print(" ENTER:");
+  Serial.print(ACCEL_STABLE_ENTER_TOL, 2);
+
+  Serial.print(" EXIT:");
+  Serial.println(ACCEL_STABLE_EXIT_TOL, 2);
 }
+
+// --------------------------------------------------
+// setup
+// --------------------------------------------------
 
 void setup() {
   Serial.begin(115200);
@@ -286,21 +248,10 @@ void setup() {
 
   Wire.begin(I2C_SDA, I2C_SCL);
 
-  // 네 기존 안정 코드 기준 유지.
-  // 400kHz로 올리지 마라. I2C Error -1 다시 날 수 있음.
   Wire.setClock(100000);
   Wire.setTimeOut(50);
 
-  Serial.println();
-  Serial.println("==== CTS WRIST IMU DECOUPLED ANGLE TEST ====");
-  Serial.println("-Y axis = finger direction");
-  Serial.println("+Y axis = wrist direction");
-  Serial.println("Sensor position = back of hand");
-  Serial.println("AHRS removed");
-  Serial.println("FINAL wrist = atan2(ay, sqrt(ax^2 + az^2))");
-  Serial.println("FINAL palm  = atan2(ax, az_corrected)");
-  Serial.println("DECOUPLING  = 2x2 cross-coupling correction");
-  Serial.println();
+  Serial.println("==== CTS WRIST IMU TEST ====");
 
   lsmReady = initLSM6DSOX();
 
@@ -316,8 +267,6 @@ void setup() {
   lsm6dsox.setAccelDataRate(LSM6DS_RATE_104_HZ);
   lsm6dsox.setGyroDataRate(LSM6DS_RATE_104_HZ);
 
-  Serial.println("LSM6DSOX configured");
-
   magReady = initLIS3MDL();
 
   if (magReady) {
@@ -325,10 +274,8 @@ void setup() {
     lis3mdl.setOperationMode(LIS3MDL_CONTINUOUSMODE);
     lis3mdl.setDataRate(LIS3MDL_DATARATE_80_HZ);
     lis3mdl.setRange(LIS3MDL_RANGE_4_GAUSS);
-
-    Serial.println("LIS3MDL configured");
   } else {
-    Serial.println("WARNING: LIS3MDL not found. Continue with accel/gyro only.");
+    Serial.println("LIS3MDL SKIP");
   }
 
 #if ENABLE_CALIBRATION
@@ -336,15 +283,18 @@ void setup() {
 #else
   wristNeutralDeg = 0.0f;
   palmNeutralDeg = 0.0f;
-  palmTiltNeutralDeg = 0.0f;
+  accelNeutralTotal = 9.8f;
+  accelStableState = true;
 
-  Serial.println();
-  Serial.println("Neutral calibration skipped");
-  Serial.println();
+  Serial.println("CAL SKIP");
 #endif
 
-  Serial.println("Start angle output");
+  Serial.println("START");
 }
+
+// --------------------------------------------------
+// loop
+// --------------------------------------------------
 
 void loop() {
   static uint32_t lastSampleMs = 0;
@@ -369,50 +319,30 @@ void loop() {
   float ay = accel.acceleration.y;
   float az = accel.acceleration.z;
 
-  float gx = gyro.gyro.x;
-  float gy = gyro.gyro.y;
-  float gz = gyro.gyro.z;
+  float accelTotal = sqrt(ax * ax + ay * ay + az * az);
+  float accelErr = fabs(accelTotal - accelNeutralTotal);
 
-  float mx = 0.0f;
-  float my = 0.0f;
-  float mz = 0.0f;
+  // --------------------------------------------------
+  // accelStable 히스테리시스 판정
+  // --------------------------------------------------
 
-  if (magReady) {
-    mx = mag.magnetic.x;
-    my = mag.magnetic.y;
-    mz = mag.magnetic.z;
+  if (accelStableState) {
+    if (accelErr > ACCEL_STABLE_EXIT_TOL) {
+      accelStableState = false;
+    }
+  } else {
+    if (accelErr < ACCEL_STABLE_ENTER_TOL) {
+      accelStableState = true;
+    }
   }
 
-  float accelTotal = sqrt(ax * ax + ay * ay + az * az);
-  float magTotal = sqrt(mx * mx + my * my + mz * mz);
+  bool accelStable = accelStableState;
 
-  // 빠른 움직임이면 가속도 기반 각도는 순간적으로 흔들릴 수 있음.
-  bool accelStable = accelTotal > 8.5f && accelTotal < 11.5f;
+  float alphaUse = accelStable ? ALPHA_STABLE : ALPHA_UNSTABLE;
 
   // --------------------------------------------------
-  // 원시 비교용 각도
+  // 각도 후보값 계산
   // --------------------------------------------------
-
-  float wristRawDeg = calcWristRawDeg(ay, az);
-  float palmRawDeg = calcPalmRawDeg(ax, az);
-
-  // --------------------------------------------------
-  // 기존 TILT 비교용
-  // --------------------------------------------------
-
-  float wristTiltRawDeg = calcWristFlexDeg(ax, ay, az);
-  float palmTiltRawDeg = calcPalmFlipTiltDeg(ax, ay, az);
-
-  float wristTiltDeg = wrap180(wristTiltRawDeg - wristNeutralDeg);
-  float palmTiltDeg = wrap180(palmTiltRawDeg - palmTiltNeutralDeg);
-
-  // --------------------------------------------------
-  // 최종 후보값
-  // --------------------------------------------------
-  // wrist: TILT 방식
-  // palm: signed corrected 방식
-  //
-  // 이 둘은 아직 교차보정 전 값이다.
 
   float wristMeasuredRawDeg = calcWristFlexDeg(ax, ay, az);
   float palmMeasuredRawDeg = calcPalmFlipSignedDeg(ax, ay, az);
@@ -421,7 +351,7 @@ void loop() {
   float palmMeasuredDeg = wrap180(palmMeasuredRawDeg - palmNeutralDeg);
 
   // --------------------------------------------------
-  // 2축 교차보정
+  // 교차보정
   // --------------------------------------------------
 
   float wristDecoupledDeg = 0.0f;
@@ -435,7 +365,7 @@ void loop() {
   );
 
   // --------------------------------------------------
-  // 최종 출력 smoothing
+  // 최종 smoothing
   // --------------------------------------------------
 
   if (!finalAngleInit) {
@@ -443,130 +373,45 @@ void loop() {
     palmFinalDeg = palmDecoupledDeg;
     finalAngleInit = true;
   } else {
-    wristFinalDeg = lowPassAngleDeg(wristFinalDeg, wristDecoupledDeg, ALPHA_FINAL);
-    palmFinalDeg = lowPassAngleDeg(palmFinalDeg, palmDecoupledDeg, ALPHA_FINAL);
+    wristFinalDeg = lowPassAngleDeg(wristFinalDeg, wristDecoupledDeg, alphaUse);
+    palmFinalDeg = lowPassAngleDeg(palmFinalDeg, palmDecoupledDeg, alphaUse);
   }
 
   wristFinalDeg = applyDeadbandDeg(wristFinalDeg, ANGLE_DEADBAND_DEG);
   palmFinalDeg = applyDeadbandDeg(palmFinalDeg, ANGLE_DEADBAND_DEG);
 
+  // --------------------------------------------------
+  // 출력
+  // --------------------------------------------------
+
   if (nowMs - lastPrintMs >= 1000 / PRINT_HZ) {
     lastPrintMs = nowMs;
 
-    Serial.println("----------------------------------------");
+    Serial.print("FINAL W:");
+    Serial.print(wristFinalDeg, 2);
 
-    // --------------------------------------------------
-    // 1. ACCEL
-    // --------------------------------------------------
-    // TOTAL이 9.8 근처면 정지/저속.
-    // STABLE NO면 순간 각도는 너무 믿지 마라.
-    Serial.print("ACCEL m/s^2 | X: ");
-    Serial.print(ax, 4);
-    Serial.print(" Y: ");
-    Serial.print(ay, 4);
-    Serial.print(" Z: ");
-    Serial.print(az, 4);
-    Serial.print(" | TOTAL: ");
-    Serial.println(accelTotal, 4);
+    Serial.print(" P:");
+    Serial.print(palmFinalDeg, 2);
 
-    Serial.print("STABLE      | ");
-    Serial.println(accelStable ? "YES" : "NO");
+    Serial.print(" | RAW W:");
+    Serial.print(wristDecoupledDeg, 2);
 
-    // --------------------------------------------------
-    // 2. GYRO
-    // --------------------------------------------------
-    // 지금 최종 각도 계산에는 안 씀.
-    // 움직임이 빠른지 확인하는 참고값.
-    Serial.print("GYRO rad/s  | X: ");
-    Serial.print(gx, 4);
-    Serial.print(" Y: ");
-    Serial.print(gy, 4);
-    Serial.print(" Z: ");
-    Serial.println(gz, 4);
+    Serial.print(" P:");
+    Serial.print(palmDecoupledDeg, 2);
 
-    // --------------------------------------------------
-    // 3. MAG
-    // --------------------------------------------------
-    // AHRS 제거했으므로 최종 계산에는 안 씀.
-    // 자기계 상태 확인용 출력만 유지.
-    if (magReady) {
-      Serial.print("MAG uT      | X: ");
-      Serial.print(mx, 4);
-      Serial.print(" Y: ");
-      Serial.print(my, 4);
-      Serial.print(" Z: ");
-      Serial.print(mz, 4);
-      Serial.print(" | TOTAL: ");
-      Serial.println(magTotal, 4);
-    }
+    Serial.print(" | A:");
+    Serial.print(accelTotal, 2);
 
-    // --------------------------------------------------
-    // 4. 최종값
-    // --------------------------------------------------
-    // 지금 제일 봐야 하는 줄.
-    // 앱/알림/판정에 쓸 후보값.
-    //
-    // wrist_flex:
-    //   손목 굽힘/젖힘
-    //
-    // palm_flip:
-    //   손바닥 뒤집힘
-    //
-    // 이 값은 둘 다 동시에 업데이트된다.
-    // 한쪽 움직인다고 반대쪽을 강제로 고정하지 않는다.
-    Serial.print("ANGLE FINAL | wrist_flex: ");
-    Serial.print(wristFinalDeg, 3);
-    Serial.print(" | palm_flip: ");
-    Serial.println(palmFinalDeg, 3);
+    Serial.print(" A0:");
+    Serial.print(accelNeutralTotal, 2);
 
-    // --------------------------------------------------
-    // 5. 교차보정 전/후 비교
-    // --------------------------------------------------
-    // measured:
-    //   공식으로 바로 계산한 값
-    //
-    // decoupled:
-    //   COUPLE 계수로 교차 간섭을 뺀 값
-    //
-    // 처음에는 COUPLE이 0이라 measured와 decoupled가 거의 같다.
-    Serial.print("DECOUP RAW  | wrist_measured: ");
-    Serial.print(wristMeasuredDeg, 3);
-    Serial.print(" | palm_measured: ");
-    Serial.print(palmMeasuredDeg, 3);
-    Serial.print(" | wrist_decoupled: ");
-    Serial.print(wristDecoupledDeg, 3);
-    Serial.print(" | palm_decoupled: ");
-    Serial.println(palmDecoupledDeg, 3);
+    Serial.print(" E:");
+    Serial.print(accelErr, 2);
 
-    // --------------------------------------------------
-    // 6. 기존 TILT 비교용
-    // --------------------------------------------------
-    // 기존 방식이 얼마나 튀는지 비교하는 줄.
-    // 최종 판단은 ANGLE FINAL을 봐라.
-    Serial.print("ATAN2 TILT  | wrist_flex: ");
-    Serial.print(wristTiltDeg, 3);
-    Serial.print(" | palm_flip: ");
-    Serial.println(palmTiltDeg, 3);
+    Serial.print(" | S:");
+    Serial.print(accelStable ? "Y" : "N");
 
-    // --------------------------------------------------
-    // 7. RAW 비교용1
-    // --------------------------------------------------
-    // 문제 원인 확인용.
-    // 최종값으로 쓰지 마라.
-    Serial.print("ATAN2 RAW   | wrist_raw: ");
-    Serial.print(wristRawDeg, 3);
-    Serial.print(" | palm_raw: ");
-    Serial.println(palmRawDeg, 3);
-
-    // --------------------------------------------------
-    // 8. 보정 계수 확인
-    // --------------------------------------------------
-    Serial.print("COUPLE      | wrist_from_palm: ");
-    Serial.print(COUPLE_WRIST_FROM_PALM, 3);
-    Serial.print(" | palm_from_wrist: ");
-    Serial.println(COUPLE_PALM_FROM_WRIST, 3);
-
-    Serial.print("TEMP C      | ");
-    Serial.println(temp.temperature, 2);
+    Serial.print(" | F:");
+    Serial.println(alphaUse, 2);
   }
 }
